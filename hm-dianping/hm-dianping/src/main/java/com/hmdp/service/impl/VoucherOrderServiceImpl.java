@@ -22,6 +22,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import javax.annotation.Resource;
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -61,11 +62,18 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     //异步处理线程池
     private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
+    private volatile boolean running = true;
 
     //在类初始化之后执行，因为当这个类初始化好了之后，随时都是有可能要执行的
     @PostConstruct
     private void init() {
         SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
+    }
+
+    @PreDestroy
+    private void destroy() {
+        running = false;
+        SECKILL_ORDER_EXECUTOR.shutdownNow();
     }
 
     // 用于线程池处理的任务
@@ -74,7 +82,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         String queueName = "stream.orders";
         @Override
         public void run() {
-            while (true) {
+            while (running && !Thread.currentThread().isInterrupted()) {
                 try {
                     // 1.获取消息队列中的订单信息 XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS s1 >
                     List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
@@ -96,6 +104,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     // 4.确认消息 XACK
                     stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", record.getId());
                 } catch (Exception e) {
+                    if (!running || Thread.currentThread().isInterrupted() || isRedisFactoryDestroyed(e)) {
+                        log.info("订单处理线程已停止");
+                        break;
+                    }
                     log.error("处理订单异常", e);
                     //处理异常消息
                     handlePendingList();
@@ -106,7 +118,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     private void handlePendingList() {
         String queueName = "stream.orders";
-        while (true) {
+        while (running && !Thread.currentThread().isInterrupted()) {
             try {
                 // 1.获取pending-list中的订单信息 XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS s1 0
                 List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
@@ -128,14 +140,32 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 // 4.确认消息 XACK
                 stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", record.getId());
             } catch (Exception e) {
-                log.error("处理pendding订单异常", e);
+                if (!running || Thread.currentThread().isInterrupted() || isRedisFactoryDestroyed(e)) {
+                    log.info("pending-list处理线程已停止");
+                    break;
+                }
+                log.error("处理pending订单异常", e);
                 try{
                     Thread.sleep(20);
                 }catch(Exception ex){
-                    ex.printStackTrace();
+                    Thread.currentThread().interrupt();
+                    break;
                 }
             }
         }
+    }
+
+    private boolean isRedisFactoryDestroyed(Throwable throwable) {
+        Throwable cause = throwable;
+        while (cause != null) {
+            if (cause instanceof IllegalStateException
+                    && cause.getMessage() != null
+                    && cause.getMessage().contains("LettuceConnectionFactory was destroyed")) {
+                return true;
+            }
+            cause = cause.getCause();
+        }
+        return false;
     }
 
     private void handleVoucherOrder(VoucherOrder voucherOrder) {
